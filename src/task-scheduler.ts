@@ -78,7 +78,11 @@ export interface SchedulerDependencies {
 function isQuietHours(): boolean {
   const now = new Date();
   const hour = parseInt(
-    now.toLocaleString('en-US', { timeZone: 'Europe/Kiev', hour: 'numeric', hour12: false })
+    now.toLocaleString('en-US', {
+      timeZone: 'Europe/Dublin',
+      hour: 'numeric',
+      hour12: false,
+    }),
   );
   return hour >= 23 || hour < 8;
 }
@@ -272,7 +276,10 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
 
         // Quiet hours: suppress proactive messages between 23:00 and 08:00 (Europe/Kiev)
         if (isQuietHours()) {
-          logger.info({ taskId: currentTask.id }, 'Quiet hours: skipping scheduled task');
+          logger.info(
+            { taskId: currentTask.id },
+            'Quiet hours: skipping scheduled task',
+          );
           continue;
         }
 
