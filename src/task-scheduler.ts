@@ -75,6 +75,14 @@ export interface SchedulerDependencies {
   sendMessage: (jid: string, text: string) => Promise<void>;
 }
 
+function isQuietHours(): boolean {
+  const now = new Date();
+  const hour = parseInt(
+    now.toLocaleString('en-US', { timeZone: 'Europe/Kiev', hour: 'numeric', hour12: false })
+  );
+  return hour >= 23 || hour < 8;
+}
+
 async function runTask(
   task: ScheduledTask,
   deps: SchedulerDependencies,
@@ -259,6 +267,12 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
         // Re-check task status in case it was paused/cancelled
         const currentTask = getTaskById(task.id);
         if (!currentTask || currentTask.status !== 'active') {
+          continue;
+        }
+
+        // Quiet hours: suppress proactive messages between 23:00 and 08:00 (Europe/Kiev)
+        if (isQuietHours()) {
+          logger.info({ taskId: currentTask.id }, 'Quiet hours: skipping scheduled task');
           continue;
         }
 
