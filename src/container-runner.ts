@@ -27,6 +27,7 @@ import {
   stopContainer,
 } from './container-runtime.js';
 import { detectAuthMode } from './credential-proxy.js';
+import { readEnvFile } from './env.js';
 import { validateAdditionalMounts } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
 
@@ -233,21 +234,61 @@ function buildContainerArgs(
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
 
-  // Route API traffic through the credential proxy (containers never see real secrets)
-  args.push(
-    '-e',
-    `ANTHROPIC_BASE_URL=http://${CONTAINER_HOST_GATEWAY}:${CREDENTIAL_PROXY_PORT}`,
-  );
+  // Route API traffic: use direct credentials for OpenRouter (avoids proxy streaming issues)
+  // For native Anthropic, use credential proxy for security
+  const containerSecrets = readEnvFile([
+    'ANTHROPIC_BASE_URL',
+    'ANTHROPIC_API_KEY',
+    'ANTHROPIC_AUTH_TOKEN',
+    'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+    'ANTHROPIC_DEFAULT_SONNET_MODEL',
+    'ANTHROPIC_DEFAULT_OPUS_MODEL',
+  ]);
+  const containerBaseUrl = containerSecrets.ANTHROPIC_BASE_URL || '';
+  const isOpenRouter =
+    containerBaseUrl && !containerBaseUrl.includes('api.anthropic.com');
 
-  // Mirror the host's auth method with a placeholder value.
-  // API key mode: SDK sends x-api-key, proxy replaces with real key.
-  // OAuth mode:   SDK exchanges placeholder token for temp API key,
-  //               proxy injects real OAuth token on that exchange request.
-  const authMode = detectAuthMode();
-  if (authMode === 'api-key') {
-    args.push('-e', 'ANTHROPIC_API_KEY=placeholder');
+  if (isOpenRouter) {
+    // Direct credentials - bypass proxy for OpenRouter compatibility
+    args.push('-e', `ANTHROPIC_BASE_URL=${containerBaseUrl}`);
+    const authToken =
+      containerSecrets.ANTHROPIC_AUTH_TOKEN ||
+      containerSecrets.ANTHROPIC_API_KEY ||
+      '';
+    if (containerSecrets.ANTHROPIC_AUTH_TOKEN) {
+      args.push('-e', `ANTHROPIC_AUTH_TOKEN=${authToken}`);
+      args.push('-e', 'ANTHROPIC_API_KEY=');
+    } else {
+      args.push('-e', `ANTHROPIC_API_KEY=${authToken}`);
+    }
+    if (containerSecrets.ANTHROPIC_DEFAULT_HAIKU_MODEL)
+      args.push(
+        '-e',
+        `ANTHROPIC_DEFAULT_HAIKU_MODEL=${containerSecrets.ANTHROPIC_DEFAULT_HAIKU_MODEL}`,
+      );
+    if (containerSecrets.ANTHROPIC_DEFAULT_SONNET_MODEL)
+      args.push(
+        '-e',
+        `ANTHROPIC_DEFAULT_SONNET_MODEL=${containerSecrets.ANTHROPIC_DEFAULT_SONNET_MODEL}`,
+      );
+    if (containerSecrets.ANTHROPIC_DEFAULT_OPUS_MODEL)
+      args.push(
+        '-e',
+        `ANTHROPIC_DEFAULT_OPUS_MODEL=${containerSecrets.ANTHROPIC_DEFAULT_OPUS_MODEL}`,
+      );
   } else {
-    args.push('-e', 'CLAUDE_CODE_OAUTH_TOKEN=placeholder');
+    // Route API traffic through the credential proxy (containers never see real secrets)
+    args.push(
+      '-e',
+      `ANTHROPIC_BASE_URL=http://${CONTAINER_HOST_GATEWAY}:${CREDENTIAL_PROXY_PORT}`,
+    );
+    // Mirror the host's auth method with a placeholder value.
+    const authMode = detectAuthMode();
+    if (authMode === 'api-key') {
+      args.push('-e', 'ANTHROPIC_API_KEY=placeholder');
+    } else {
+      args.push('-e', 'CLAUDE_CODE_OAUTH_TOKEN=placeholder');
+    }
   }
 
   // Runtime-specific args for host gateway resolution

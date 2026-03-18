@@ -1,3 +1,4 @@
+import http from 'http';
 import https from 'https';
 import { Api, Bot } from 'grammy';
 
@@ -11,6 +12,130 @@ import {
   OnInboundMessage,
   RegisteredGroup,
 } from '../types.js';
+
+async function transcribeVoice(
+  audioBuffer: Buffer,
+  filename: string,
+): Promise<string | null> {
+  return new Promise((resolve) => {
+    const sep = String.fromCharCode(13, 10);
+    const boundary = '----WhisperBoundary' + Date.now().toString(16);
+    const modelPart = Buffer.from(
+      '--' +
+        boundary +
+        sep +
+        'Content-Disposition: form-data; name="model"' +
+        sep +
+        sep +
+        'Systran/faster-whisper-small' +
+        sep,
+      'utf8',
+    );
+    const fileHeader = Buffer.from(
+      '--' +
+        boundary +
+        sep +
+        'Content-Disposition: form-data; name="file"; filename="' +
+        filename +
+        '"' +
+        sep +
+        'Content-Type: audio/ogg' +
+        sep +
+        sep,
+      'utf8',
+    );
+    const footer = Buffer.from(sep + '--' + boundary + '--' + sep, 'utf8');
+    const body = Buffer.concat([modelPart, fileHeader, audioBuffer, footer]);
+    const req = http.request(
+      {
+        hostname: '46.62.246.93',
+        port: 9000,
+        path: '/v1/audio/transcriptions',
+        method: 'POST',
+        headers: {
+          'Content-Type': 'multipart/form-data; boundary=' + boundary,
+          'Content-Length': body.length,
+          Accept: 'application/json',
+        },
+      },
+      (res: any) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (c: any) => chunks.push(c));
+        res.on('end', () => {
+          const rawBody = Buffer.concat(chunks).toString('utf8');
+          if (res.statusCode === 200) {
+            try {
+              resolve(
+                (JSON.parse(rawBody) as { text: string }).text.trim() || null,
+              );
+            } catch {
+              resolve(rawBody.trim() || null);
+            }
+          } else {
+            logger.warn(
+              { status: res.statusCode, body: rawBody.slice(0, 200) },
+              'Whisper transcription error',
+            );
+            resolve(null);
+          }
+        });
+      },
+    );
+    req.on('error', (err: any) => {
+      logger.warn({ err: err.message }, 'Whisper request error');
+      resolve(null);
+    });
+    req.write(body);
+    req.end();
+  });
+}
+async function downloadTelegramFile(
+  token: string,
+  fileId: string,
+): Promise<Buffer | null> {
+  return new Promise((resolve) => {
+    const api = new Api(token);
+    api
+      .getFile(fileId)
+      .then((file) => {
+        if (!file.file_path) {
+          resolve(null);
+          return;
+        }
+        const url =
+          'https://api.telegram.org/file/bot' + token + '/' + file.file_path;
+        const urlObj = new URL(url);
+        const options = {
+          hostname: urlObj.hostname,
+          path: urlObj.pathname + urlObj.search,
+        };
+        https
+          .get(options, (res: any) => {
+            const chunks: Buffer[] = [];
+            res.on('data', (chunk: any) => chunks.push(chunk));
+            res.on('end', () => resolve(Buffer.concat(chunks)));
+            res.on('error', () => resolve(null));
+          })
+          .on('error', () => resolve(null));
+      })
+      .catch(() => resolve(null));
+  });
+}
+
+const ACK_MESSAGES = [
+  'Понял, работаю над этим...',
+  'Принято! Сейчас разберусь.',
+  'Хорошо, уже думаю над этим.',
+  'Окей, обрабатываю твой запрос.',
+  'Понял тебя, сейчас отвечу.',
+  'Получил! Дай мне секунду.',
+  'Уже занимаюсь этим.',
+  'Принял задачу, думаю...',
+];
+
+function randomAck(): string {
+  return ACK_MESSAGES[Math.floor(Math.random() * ACK_MESSAGES.length)];
+}
 
 export interface TelegramChannelOpts {
   onMessage: OnInboundMessage;
@@ -80,6 +205,37 @@ export class TelegramChannel implements Channel {
       ctx.reply(`${ASSISTANT_NAME} is online.`);
     });
 
+    // Command to show help
+    this.bot.command('help', (ctx) => {
+      ctx.reply(
+        `*Команды бота:*
+
+` +
+          `/ping — проверить что бот онлайн
+` +
+          `/chatid — получить ID этого чата
+` +
+          `/help — показать это сообщение
+
+` +
+          `*Как общаться:*
+` +
+          `Напиши *@Andy* + вопрос или задание
+` +
+          `Отправь голосовое сообщение — бот транскрибирует и ответит
+
+` +
+          `*Примеры:*
+` +
+          `@Andy найди информацию о...
+` +
+          `@Andy напиши письмо...
+` +
+          `@Andy переведи текст...`,
+        { parse_mode: 'Markdown' },
+      );
+    });
+
     // Telegram bot commands handled above — skip them in the general handler
     // so they don't also get stored as messages. All other /commands flow through.
     const TELEGRAM_BOT_COMMANDS = new Set(['chatid', 'ping']);
@@ -111,9 +267,10 @@ export class TelegramChannel implements Channel {
       // Telegram @mentions (e.g., @andy_ai_bot) won't match TRIGGER_PATTERN
       // (e.g., ^@Andy\b), so we prepend the trigger when the bot is @mentioned.
       const botUsername = ctx.me?.username?.toLowerCase();
+      let isBotMentioned = false;
       if (botUsername) {
         const entities = ctx.message.entities || [];
-        const isBotMentioned = entities.some((entity) => {
+        isBotMentioned = entities.some((entity) => {
           if (entity.type === 'mention') {
             const mentionText = content
               .substring(entity.offset, entity.offset + entity.length)
@@ -159,6 +316,12 @@ export class TelegramChannel implements Channel {
         is_from_me: false,
       });
 
+      // Send acknowledgement so user knows the bot is processing
+      const isPrivate = ctx.chat.type === 'private';
+      if (isPrivate || TRIGGER_PATTERN.test(content) || isBotMentioned) {
+        ctx.reply(randomAck()).catch(() => {});
+      }
+
       logger.info(
         { chatJid, chatName, sender: senderName },
         'Telegram message stored',
@@ -201,8 +364,49 @@ export class TelegramChannel implements Channel {
 
     this.bot.on('message:photo', (ctx) => storeNonText(ctx, '[Photo]'));
     this.bot.on('message:video', (ctx) => storeNonText(ctx, '[Video]'));
-    this.bot.on('message:voice', (ctx) => storeNonText(ctx, '[Voice message]'));
-    this.bot.on('message:audio', (ctx) => storeNonText(ctx, '[Audio]'));
+    this.bot.on('message:voice', async (ctx) => {
+      const fileId = ctx.message.voice?.file_id;
+      if (fileId) {
+        try {
+          const buf = await downloadTelegramFile(this.botToken, fileId);
+          if (buf) {
+            const transcript = await transcribeVoice(buf, 'voice.ogg');
+            if (transcript) {
+              storeNonText(ctx, transcript);
+              ctx.reply('🎤 «' + transcript + '»').catch(() => {});
+              return;
+            }
+          }
+        } catch (e: any) {
+          logger.warn(
+            { err: e.message },
+            'Voice transcription failed, using placeholder',
+          );
+        }
+      }
+      storeNonText(ctx, '[Voice message]');
+    });
+    this.bot.on('message:audio', async (ctx) => {
+      const fileId = ctx.message.audio?.file_id;
+      if (fileId) {
+        try {
+          const buf = await downloadTelegramFile(this.botToken, fileId);
+          if (buf) {
+            const transcript = await transcribeVoice(buf, 'audio.mp3');
+            if (transcript) {
+              storeNonText(ctx, transcript);
+              return;
+            }
+          }
+        } catch (e: any) {
+          logger.warn(
+            { err: e.message },
+            'Audio transcription failed, using placeholder',
+          );
+        }
+      }
+      storeNonText(ctx, '[Audio]');
+    });
     this.bot.on('message:document', (ctx) => {
       const name = ctx.message.document?.file_name || 'file';
       storeNonText(ctx, `[Document: ${name}]`);
@@ -218,6 +422,13 @@ export class TelegramChannel implements Channel {
     this.bot.catch((err) => {
       logger.error({ err: err.message }, 'Telegram bot error');
     });
+
+    // Register bot commands in Telegram menu
+    await this.bot.api.setMyCommands([
+      { command: 'ping', description: 'Проверить что бот онлайн' },
+      { command: 'help', description: 'Показать список команд' },
+      { command: 'chatid', description: 'Получить ID этого чата' },
+    ]);
 
     // Start polling — returns a Promise that resolves when started
     return new Promise<void>((resolve) => {

@@ -63,9 +63,16 @@ export function startCredentialProxy(
         delete headers['transfer-encoding'];
 
         if (authMode === 'api-key') {
-          // API key mode: inject x-api-key on every request
+          // API key mode: inject auth header
+          // Use Authorization: Bearer for OpenRouter/custom endpoints, x-api-key for native Anthropic
           delete headers['x-api-key'];
-          headers['x-api-key'] = secrets.ANTHROPIC_API_KEY;
+          delete headers['authorization'];
+          const baseUrl = secrets.ANTHROPIC_BASE_URL || '';
+          if (baseUrl && !baseUrl.includes('api.anthropic.com')) {
+            headers['authorization'] = 'Bearer ' + secrets.ANTHROPIC_API_KEY;
+          } else {
+            headers['x-api-key'] = secrets.ANTHROPIC_API_KEY;
+          }
         } else {
           // OAuth mode: replace placeholder Bearer token with the real one
           // only when the container actually sends an Authorization header
@@ -83,13 +90,30 @@ export function startCredentialProxy(
           {
             hostname: upstreamUrl.hostname,
             port: upstreamUrl.port || (isHttps ? 443 : 80),
-            path: req.url,
+            path: (() => {
+              const basePath = upstreamUrl.pathname.replace(/\/+$/, '');
+              const reqPath = (req.url || '')
+                .replace(/[?&]beta=true/g, '')
+                .replace(/\?$/, '');
+              return basePath + reqPath;
+            })(),
             method: req.method,
             headers,
           } as RequestOptions,
           (upRes) => {
-            res.writeHead(upRes.statusCode!, upRes.headers);
-            upRes.pipe(res);
+            // Filter hop-by-hop headers from upstream response before forwarding
+            const resHeaders = { ...upRes.headers };
+            delete resHeaders['connection'];
+            delete resHeaders['keep-alive'];
+            delete resHeaders['transfer-encoding'];
+            delete resHeaders['upgrade'];
+            delete resHeaders['proxy-authenticate'];
+            delete resHeaders['proxy-authorization'];
+            delete resHeaders['te'];
+            delete resHeaders['trailers'];
+            delete resHeaders['alt-svc'];
+            res.writeHead(upRes.statusCode!, resHeaders);
+            upRes.pipe(res, { end: true });
           },
         );
 
@@ -104,7 +128,46 @@ export function startCredentialProxy(
           }
         });
 
-        upstream.write(body);
+        // Rewrite model name and strip unsupported fields for non-Anthropic endpoints (e.g. OpenRouter)
+        // Also strip ?beta=true from URL (SDK streaming mode not supported through proxy)
+        let outBody = body;
+        const baseUrl = secrets.ANTHROPIC_BASE_URL || '';
+        if (
+          baseUrl &&
+          !baseUrl.includes('api.anthropic.com') &&
+          req.method === 'POST'
+        ) {
+          try {
+            const parsed = JSON.parse(body.toString());
+            const openrouterModel =
+              process.env.OPENROUTER_MODEL || 'stepfun/step-3.5-flash:free';
+            if (parsed.model && parsed.model.startsWith('claude-')) {
+              parsed.model = openrouterModel;
+            }
+            // Debug: log request structure
+            logger.debug(
+              {
+                model: parsed.model,
+                stream: parsed.stream,
+                msgCount: parsed.messages?.length,
+                firstMsgContentType: typeof parsed.messages?.[0]?.content,
+              },
+              'Proxy rewriting request',
+            );
+            // Strip Claude Code SDK-specific fields unsupported by OpenRouter
+            delete parsed.output_config;
+            delete parsed.thinking;
+            delete parsed.betas;
+            // Keep stream field as-is - let upstream handle streaming
+            const rewritten = Buffer.from(JSON.stringify(parsed));
+            headers['content-length'] = rewritten.length;
+            headers['content-type'] = 'application/json';
+            outBody = rewritten;
+          } catch {
+            /* not JSON, pass through */
+          }
+        }
+        upstream.write(outBody);
         upstream.end();
       });
     });

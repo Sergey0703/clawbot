@@ -229,3 +229,108 @@ See [CHANGELOG.md](CHANGELOG.md) for breaking changes and migration notes.
 ## License
 
 MIT
+
+
+---
+
+## Deployment Notes (Server 65.21.3.89)
+
+This instance is customized for OpenRouter + voice transcription. Key differences from upstream:
+
+### OpenRouter Integration
+
+NanoClaw uses OpenRouter as the LLM backend instead of Anthropic directly.
+
+**`/opt/nanoclaw/.env`:**
+```
+ANTHROPIC_BASE_URL=https://openrouter.ai/api
+ANTHROPIC_AUTH_TOKEN=sk-or-v1-...
+ANTHROPIC_DEFAULT_SONNET_MODEL=arcee-ai/trinity-large-preview:free
+ANTHROPIC_DEFAULT_HAIKU_MODEL=arcee-ai/trinity-large-preview:free
+ANTHROPIC_DEFAULT_OPUS_MODEL=arcee-ai/trinity-large-preview:free
+```
+
+**`/opt/nanoclaw/data/sessions/main/.claude/settings.json`** -- same model vars passed into the agent container:
+```json
+{
+  "env": {
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "arcee-ai/trinity-large-preview:free",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "arcee-ai/trinity-large-preview:free",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "arcee-ai/trinity-large-preview:free"
+  }
+}
+```
+
+Three files were patched to make OpenRouter work:
+
+**`src/credential-proxy.ts`** -- Bearer auth, `/api` path prefix, strip `output_config`/`thinking`/`betas` from request body (OpenRouter does not accept these Anthropic-specific fields).
+
+**`src/container-runner.ts`** -- `isOpenRouter` bypass: passes `ANTHROPIC_AUTH_TOKEN` and model vars directly to the container env.
+
+**`src/channels/telegram.ts`** -- top-level `import http from 'http'` (ES module -- `require()` is not available).
+
+**`data/sessions/main/agent-runner-src/index.ts`** (mounted into container, overrides image):
+- `lastAssistantText +=` (accumulate streaming chunks, not overwrite)
+- Reset `lastAssistantText = ''` on `system/init` events
+- `finalText = textResult || lastAssistantText || null`
+- Ignore `ECONNRESET` and `exited with code 1` errors
+
+CRITICAL: The container mounts `/opt/nanoclaw/data/sessions/main/agent-runner-src` -> `/app/src`.
+Changes to the Docker image source do NOT apply until copied here:
+```bash
+cp /opt/nanoclaw/container/agent-runner/src/index.ts \
+   /opt/nanoclaw/data/sessions/main/agent-runner-src/index.ts
+```
+
+### Session Permissions
+
+Sessions are stored at `/opt/nanoclaw/data/sessions/main/.claude/`. The container runs as `node` (uid=1000).
+If this directory is owned by `root`, sessions are never written to disk and the bot gets "No conversation found" errors after restart.
+
+Fix:
+```bash
+chown -R 1000:1000 /opt/nanoclaw/data/sessions/main/.claude/
+```
+
+### Voice Transcription
+
+Telegram voice messages are transcribed using `fedirz/faster-whisper-server` running on server 46.62.246.93:9000.
+
+- Model: `Systran/faster-whisper-small`
+- Language: `ru` (fixed)
+- API: OpenAI-compatible `/v1/audio/transcriptions` (multipart, field name `file`)
+- Other available models on that server: `tiny`, `base`, `large-v3`
+
+Uses `String.fromCharCode(13, 10)` instead of literal `\r\n` strings to avoid CRLF injection when patching TS source via Python.
+
+### Startup Script
+
+**`/opt/nanoclaw/start.sh`** clears stale sessions on startup:
+```bash
+#!/bin/bash
+cd /opt/nanoclaw
+sqlite3 store/messages.db 'DELETE FROM sessions;' 2>/dev/null || true
+exec node dist/index.js
+```
+
+### PM2 Management
+
+```bash
+pm2 restart nanoclaw
+pm2 logs nanoclaw --lines 50 --nostream
+```
+
+### Rebuild After Code Changes
+
+```bash
+cd /opt/nanoclaw
+npm run build
+pm2 restart nanoclaw
+```
+
+### Model Notes
+
+- `arcee-ai/trinity-large-preview:free` -- current model. Clean text, no thinking blocks.
+- `nvidia/nemotron-3-super-120b-a12b:free` -- works but streams in chunks (needs `lastAssistantText +=` fix).
+- Ollama Cloud -- blocked from Hetzner datacenter IPs (403). Local only.
+- Groq -- blocked from Hetzner datacenter IPs (403). Cannot use for server-side transcription.

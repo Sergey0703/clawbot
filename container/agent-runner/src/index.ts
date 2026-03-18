@@ -365,6 +365,7 @@ async function runQuery(
   let lastAssistantUuid: string | undefined;
   let messageCount = 0;
   let resultCount = 0;
+  let lastAssistantText = '';
 
   // Load global CLAUDE.md as additional system context (shared across all groups)
   const globalClaudeMdPath = '/workspace/global/CLAUDE.md';
@@ -409,6 +410,7 @@ async function runQuery(
         'NotebookEdit',
         'mcp__nanoclaw__*',
         'mcp__gmail__*',
+        'mcp__youtube__*',
       ],
       env: sdkEnv,
       permissionMode: 'bypassPermissions',
@@ -423,6 +425,10 @@ async function runQuery(
             NANOCLAW_GROUP_FOLDER: containerInput.groupFolder,
             NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
           },
+        },
+        youtube: {
+          command: 'npx',
+          args: ['-y', '@sinco-lab/mcp-youtube-transcript'],
         },
         gmail: {
           command: 'npx',
@@ -442,7 +448,18 @@ async function runQuery(
       lastAssistantUuid = (message as { uuid: string }).uuid;
     }
 
+    // Collect text from assistant events (OpenRouter fallback: result may be empty)
+    // Nemotron streams chunks - accumulate all text pieces
+    if (message.type === 'assistant') {
+      const content = (message as { message?: { content?: Array<{type: string; text?: string}> } }).message?.content;
+      if (Array.isArray(content)) {
+        const texts = content.filter(c => c.type === 'text').map(c => c.text || '').join('');
+        if (texts) lastAssistantText += texts;
+      }
+    }
+
     if (message.type === 'system' && message.subtype === 'init') {
+      lastAssistantText = ''; // reset per-query
       newSessionId = message.session_id;
       log(`Session initialized: ${newSessionId}`);
     }
@@ -455,10 +472,11 @@ async function runQuery(
     if (message.type === 'result') {
       resultCount++;
       const textResult = 'result' in message ? (message as { result?: string }).result : null;
-      log(`Result #${resultCount}: subtype=${message.subtype}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`);
+      const finalText = textResult || lastAssistantText || null;
+      log('Result #' + resultCount + ': subtype=' + message.subtype + (finalText ? ' text=' + finalText.slice(0, 200) : '') + ' or-fallback=' + (!textResult && !!lastAssistantText));
       writeOutput({
         status: 'success',
-        result: textResult || null,
+        result: finalText,
         newSessionId
       });
     }
@@ -549,14 +567,19 @@ async function main(): Promise<void> {
     }
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
-    log(`Agent error: ${errorMessage}`);
-    writeOutput({
-      status: 'error',
-      result: null,
-      newSessionId: sessionId,
-      error: errorMessage
-    });
-    process.exit(1);
+    // OpenRouter workaround: subprocess exits with code 1 after result
+    if (errorMessage.includes('exited with code 1') || errorMessage.includes('ECONNRESET')) {
+      log('Ignoring post-result error (OpenRouter pattern): ' + errorMessage);
+    } else {
+      log('Agent error: ' + errorMessage);
+      writeOutput({
+        status: 'error',
+        result: null,
+        newSessionId: sessionId,
+        error: errorMessage
+      });
+      process.exit(1);
+    }
   }
 }
 
