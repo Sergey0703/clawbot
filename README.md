@@ -334,3 +334,31 @@ pm2 restart nanoclaw
 - `nvidia/nemotron-3-super-120b-a12b:free` -- works but streams in chunks (needs `lastAssistantText +=` fix).
 - Ollama Cloud -- blocked from Hetzner datacenter IPs (403). Local only.
 - Groq -- blocked from Hetzner datacenter IPs (403). Cannot use for server-side transcription.
+
+---
+
+## Our Customizations (Sergey0703/clawbot)
+
+**GitHub**: https://github.com/Sergey0703/clawbot
+**Server**: 65.21.3.89 (Hetzner), PM2: nanoclaw
+
+### Changes vs upstream:
+- Telegram voice transcription via faster-whisper-server (46.62.246.93:9000)
+- Acknowledgement messages + voice transcript shown in quotes
+- Gmail MCP (@gongrzhe/server-gmail-autoauth-mcp)
+- YouTube MCP (@sinco-lab/mcp-youtube-transcript)
+- Quiet hours 23:00-08:00 Europe/Dublin (scheduled tasks suppressed)
+- CLAUDE.md: user info, email, YouTube instructions
+- LLM: NVIDIA API moonshotai/kimi-k2-instruct-0905
+
+### Key files:
+- /opt/nanoclaw/.env — API keys and model config
+- /opt/nanoclaw/data/sessions/main/agent-runner-src/index.ts — active agent source
+- /opt/nanoclaw/container/agent-runner/src/index.ts — master source
+- /opt/nanoclaw/groups/main/CLAUDE.md — agent instructions
+- /opt/nanoclaw/youtube-cookies.txt — YouTube cookies
+
+### After editing index.ts:
+    cp /opt/nanoclaw/container/agent-runner/src/index.ts /opt/nanoclaw/data/sessions/main/agent-runner-src/index.ts
+    npm run build && pm2 restart nanoclaw
+    sqlite3 /opt/nanoclaw/store/messages.db 'DELETE FROM sessions;'

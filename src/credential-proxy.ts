@@ -154,10 +154,42 @@ export function startCredentialProxy(
               },
               'Proxy rewriting request',
             );
-            // Strip Claude Code SDK-specific fields unsupported by OpenRouter
+            // Strip Claude Code SDK-specific fields unsupported by non-Anthropic endpoints
             delete parsed.output_config;
             delete parsed.thinking;
             delete parsed.betas;
+
+            // Convert Anthropic format to OpenAI format for NVIDIA/OpenAI-compatible endpoints
+            const isNvidia = baseUrl.includes('integrate.api.nvidia.com') || baseUrl.includes('nvidia.com');
+            if (isNvidia) {
+              // Convert system messages: Anthropic uses system top-level, OpenAI uses role:system in messages
+              if (parsed.system && Array.isArray(parsed.messages)) {
+                const systemText = Array.isArray(parsed.system)
+                  ? parsed.system.map((b: {text?: string}) => b.text || '').join('\n')
+                  : String(parsed.system);
+                parsed.messages = [{ role: 'system', content: systemText }, ...parsed.messages];
+                delete parsed.system;
+              }
+              // Convert content arrays to strings for OpenAI
+              if (Array.isArray(parsed.messages)) {
+                parsed.messages = parsed.messages.map((msg: {role: string, content: unknown}) => {
+                  if (Array.isArray(msg.content)) {
+                    const text = (msg.content as Array<{type: string, text?: string}>)
+                      .filter((b) => b.type === 'text')
+                      .map((b) => b.text || '')
+                      .join('\n');
+                    return { ...msg, content: text };
+                  }
+                  return msg;
+                });
+              }
+              // max_tokens -> max_completion_tokens for newer NVIDIA models
+              if (parsed.max_tokens && !parsed.max_completion_tokens) {
+                parsed.max_completion_tokens = parsed.max_tokens;
+                delete parsed.max_tokens;
+              }
+            }
+
             // Keep stream field as-is - let upstream handle streaming
             const rewritten = Buffer.from(JSON.stringify(parsed));
             headers['content-length'] = rewritten.length;
